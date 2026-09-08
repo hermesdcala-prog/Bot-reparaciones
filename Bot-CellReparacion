@@ -1,0 +1,684 @@
+import sqlite3
+import logging
+import threading
+import os
+from flask import Flask
+from difflib import get_close_matches
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters
+)
+
+# --- CONFIGURACIÓN DEL SERVIDOR WEB PARA RENDER ---
+web_app = Flask('')
+
+@web_app.route('/')
+def home():
+    return "Bot de Telegram activo 24/7"
+
+def run_web():
+    # Render asigna dinámicamente la variable de entorno PORT
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_web)
+    t.start()
+
+# --- CONFIGURACIÓN DEL BOT ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+TOKEN = "8679138341:AAHb_IGSw6ObklEM-_8a6VFG0tip0QDYDDU"
+ADMIN_IDS = {653054958, 1484692515}
+
+MARCAS_VALIDAS = [
+    "Samsung", "Xiaomi", "Apple", "Huawei", "Motorola", "LG", "Nokia",
+    "Oppo", "Vivo", "Realme", "Honor", "ZTE", "Alcatel", "Sony",
+    "Asus", "Infinix", "Tecno", "OnePlus", "Google Pixel", "TCL", "BLU"
+]
+
+# Estados para las conversaciones
+MARCA, MODELO, PROBLEMA, SOLUCION_TEXTO, SOLUCION_FOTO = range(5)
+EDIT_SELECCION, EDIT_NUEVO_NOMBRE = range(5, 7)
+GEST_MARCA, GEST_MODELO, GEST_PROB, GEST_ACCION, GEST_EDIT_TEXTO, GEST_EDIT_FOTO = range(7, 13)
+
+# --- BASE DE DATOS ---
+def init_db():
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS marcas (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT UNIQUE)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS modelos (id INTEGER PRIMARY KEY AUTOINCREMENT, marca_id INTEGER, nombre TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS problemas (id INTEGER PRIMARY KEY AUTOINCREMENT, modelo_id INTEGER, titulo TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS soluciones (id INTEGER PRIMARY KEY AUTOINCREMENT, problema_id INTEGER, texto TEXT, photo_id TEXT)''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS valoraciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            solucion_id INTEGER,
+            user_id INTEGER,
+            sirvio INTEGER,
+            UNIQUE(solucion_id, user_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- FUNCIONES AUXILIARES ---
+def normalizar_marca(nombre_ingresado: str) -> str:
+    coincidencias = get_close_matches(nombre_ingresado.strip().capitalize(), MARCAS_VALIDAS, n=1, cutoff=0.6)
+    if coincidencias:
+        return coincidencias[0]
+    return nombre_ingresado.strip().capitalize()
+
+async def borrar_mensaje_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    try:
+        await context.bot.delete_message(chat_id=job.data["chat_id"], message_id=job.data["message_id"])
+    except Exception:
+        pass
+
+async def enviar_auto_borrable(context: ContextTypes.DEFAULT_TYPE, send_coroutine, segundos: int = 3600):
+    msg = await send_coroutine
+    context.job_queue.run_once(
+        borrar_mensaje_job,
+        when=segundos,
+        data={"chat_id": msg.chat_id, "message_id": msg.message_id}
+    )
+    return msg
+
+def get_main_keyboard(user_id: int):
+    keyboard = [
+        [KeyboardButton("📱 Ver Marcas"), KeyboardButton("🔍 Buscar Modelo")],
+        [KeyboardButton("➕ Agregar Solución"), KeyboardButton("⭐ Hacerse Miembro")]
+    ]
+    if user_id in ADMIN_IDS:
+        keyboard.append([KeyboardButton("✏️ Editar Categoría"), KeyboardButton("🗑️ Gestionar / Borrar")])
+        keyboard.append([KeyboardButton("🧹 Limpiar Chat")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# --- INICIO Y MENÚ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 **¡Bienvenido a El Holandés Soluciones!**\n\n"
+        "Este bot está diseñado para facilitar soluciones rápidas a problemas comunes en talleres de celulares.\n\n"
+        "Toca el botón de abajo para desplegar el menú principal."
+    )
+    keyboard = [[InlineKeyboardButton("🚀 Iniciar Bot", callback_data="iniciar_menu")]]
+    if update.message:
+        await enviar_auto_borrable(context, update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)))
+
+async def desplegar_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    main_menu = get_main_keyboard(user_id)
+    await query.edit_message_text("✅ **Menú activado.** Selecciona una opción en la botonera de abajo:", parse_mode="Markdown")
+    await enviar_auto_borrable(context, query.message.reply_text("👇 Opciones disponibles:", reply_markup=main_menu))
+
+# --- NAVEGACIÓN GENERAL ---
+async def mostrar_marcas(update: Update, context: ContextTypes.DEFAULT_TYPE, message_obj=None):
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, nombre FROM marcas ORDER BY nombre ASC")
+    marcas = cursor.fetchall()
+    conn.close()
+
+    msg = message_obj or (update.message if update.message else update.callback_query.message)
+
+    if not marcas:
+        await enviar_auto_borrable(context, msg.reply_text("⚠️ **La base de datos se encuentra vacía.**", parse_mode="Markdown"))
+        return
+
+    inline_keyboard = []
+    row = []
+    for m in marcas:
+        row.append(InlineKeyboardButton(f"📱 {m[1]}", callback_data=f"marca_{m[0]}"))
+        if len(row) == 2:
+            inline_keyboard.append(row)
+            row = []
+    if row:
+        inline_keyboard.append(row)
+
+    inline_keyboard.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="iniciar_menu")])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text("📱 **Selecciona una marca:**", reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await enviar_auto_borrable(context, msg.reply_text("📱 **Selecciona una marca:**", reply_markup=reply_markup, parse_mode="Markdown"))
+
+async def user_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if query.data == "iniciar_menu":
+        await desplegar_menu(update, context)
+        return
+
+    if query.data == "ver_marcas_nav":
+        await query.answer()
+        await mostrar_marcas(update, context)
+        return
+
+    data = query.data.split("_")
+    action = data[0]
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+
+    if action == "voto":
+        await query.answer()
+        solucion_id, sirvio, user_id = int(data[1]), int(data[2]), query.from_user.id
+        try:
+            cursor.execute("INSERT INTO valoraciones (solucion_id, user_id, sirvio) VALUES (?, ?, ?)", (solucion_id, user_id, sirvio))
+            conn.commit()
+            msg_text = "👍 **¡Excelente!** Nos alegra saber que te sirvió." if sirvio == 1 else "👎 **Gracias.** Revisaremos esta solución."
+            await query.message.reply_text(msg_text, parse_mode="Markdown")
+        except sqlite3.IntegrityError:
+            await query.message.reply_text("⚠️ Ya habías valorado esta solución previamente.")
+        conn.close()
+        return
+
+    await query.answer()
+
+    if action == "marca":
+        marca_id = data[1]
+        cursor.execute("SELECT id, nombre FROM modelos WHERE marca_id = ? ORDER BY nombre ASC", (marca_id,))
+        modelos = cursor.fetchall()
+
+        keyboard = [[InlineKeyboardButton(f"📲 {m[1]}", callback_data=f"modelo_{m[0]}")] for m in modelos]
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Volver a Marcas", callback_data="ver_marcas_nav"),
+            InlineKeyboardButton("🏠 Inicio", callback_data="iniciar_menu")
+        ])
+
+        await query.edit_message_text("📐 **Selecciona el modelo:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif action == "modelo":
+        modelo_id = data[1]
+        cursor.execute("SELECT marca_id FROM modelos WHERE id = ?", (modelo_id,))
+        res_m = cursor.fetchone()
+        marca_id = res_m[0] if res_m else None
+
+        cursor.execute("SELECT id, titulo FROM problemas WHERE modelo_id = ?", (modelo_id,))
+        problemas = cursor.fetchall()
+
+        keyboard = [[InlineKeyboardButton(f"⚠️ {p[1]}", callback_data=f"prob_{p[0]}")] for p in problemas]
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Volver a Modelos", callback_data=f"marca_{marca_id}" if marca_id else "ver_marcas_nav"),
+            InlineKeyboardButton("🏠 Inicio", callback_data="iniciar_menu")
+        ])
+
+        await query.edit_message_text("⚠️ **Selecciona la falla / problema:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif action == "prob":
+        prob_id = data[1]
+        cursor.execute("SELECT modelo_id FROM problemas WHERE id = ?", (prob_id,))
+        res_p = cursor.fetchone()
+        modelo_id = res_p[0] if res_p else None
+
+        cursor.execute("SELECT id, texto, photo_id FROM soluciones WHERE problema_id = ?", (prob_id,))
+        solucion = cursor.fetchone()
+
+        if solucion:
+            sol_id, texto, photo_id = solucion[0], solucion[1], solucion[2]
+
+            cursor.execute("SELECT COUNT(*), SUM(sirvio) FROM valoraciones WHERE solucion_id = ?", (sol_id,))
+            res_val = cursor.fetchone()
+            total_votos = res_val[0]
+            votos_positivos = res_val[1] if res_val[1] is not None else 0
+
+            porcentaje = int((votos_positivos / total_votos) * 100) if total_votos > 0 else 0
+            info_val = f"\n\n📊 **Efectividad:** {porcentaje}% ({votos_positivos}/{total_votos})\n\n¿Te sirvió esta solución?" if total_votos > 0 else "\n\n📊 **Efectividad:** Sin votos aún.\n\n¿Te sirvió esta solución?"
+
+            keyboard = [
+                [InlineKeyboardButton("👍 Sí me sirvió", callback_data=f"voto_{sol_id}_1"), InlineKeyboardButton("👎 No me sirvió", callback_data=f"voto_{sol_id}_0")],
+                [InlineKeyboardButton("⬅️ Volver a Problemas", callback_data=f"modelo_{modelo_id}" if modelo_id else "ver_marcas_nav"), InlineKeyboardButton("🏠 Inicio", callback_data="iniciar_menu")]
+            ]
+            markup = InlineKeyboardMarkup(keyboard)
+
+            if photo_id:
+                await enviar_auto_borrable(context, query.message.reply_photo(photo=photo_id, caption=f"🛠 **Solución:**\n\n{texto}{info_val}", parse_mode="Markdown", reply_markup=markup))
+            else:
+                await enviar_auto_borrable(context, query.message.reply_text(f"🛠 **Solución:**\n\n{texto}{info_val}", parse_mode="Markdown", reply_markup=markup))
+        else:
+            await query.edit_message_text("No hay solución registrada.")
+
+    conn.close()
+
+# --- MANEJADOR DE TECLADO TEXTUAL ---
+async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    if text == "📱 Ver Marcas":
+        await mostrar_marcas(update, context)
+
+    elif text == "🔍 Buscar Modelo":
+        context.user_data['esperando_busqueda'] = True
+        await enviar_auto_borrable(context, update.message.reply_text("🔍 **Escribe el modelo que deseas consultar (ej: A12, Redmi 10, P30):**", parse_mode="Markdown"))
+
+    elif text == "✏️ Editar Categoría":
+        if user_id in ADMIN_IDS:
+            await iniciar_edicion(update, context)
+
+    elif text == "🧹 Limpiar Chat":
+        if user_id in ADMIN_IDS:
+            await limpiar_busquedas(update, context)
+
+    elif text == "⭐ Hacerse Miembro":
+        mensaje_membresia = (
+            "⭐ **Membresía VIP / Acceso Premium**\n\n"
+            "¡Obtén acceso ilimitado a soluciones técnicas, esquemáticos y guías de reparación!\n\n"
+            "📩 Contacta al administrador para más detalles."
+        )
+        await enviar_auto_borrable(context, update.message.reply_text(mensaje_membresia, parse_mode="Markdown"))
+
+    else:
+        if context.user_data.get('esperando_busqueda'):
+            context.user_data['esperando_busqueda'] = False
+        await ejecutar_busqueda(update, context, text)
+
+# --- BÚSQUEDA DIRECTA DE MODELOS ---
+async def ejecutar_busqueda(update: Update, context: ContextTypes.DEFAULT_TYPE, busqueda: str):
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT modelos.id, modelos.nombre, marcas.nombre
+        FROM modelos JOIN marcas ON modelos.marca_id = marcas.id
+        WHERE modelos.nombre LIKE ? LIMIT 10
+    """, (f"%{busqueda}%",))
+    resultados = cursor.fetchall()
+    conn.close()
+
+    if not resultados:
+        await enviar_auto_borrable(context, update.message.reply_text(f"🔍 No se encontraron resultados para: **{busqueda}**.", parse_mode="Markdown"))
+        return
+
+    keyboard = [[InlineKeyboardButton(f"📲 {r[2]} {r[1]}", callback_data=f"modelo_{r[0]}")] for r in resultados]
+    keyboard.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="iniciar_menu")])
+    await enviar_auto_borrable(context, update.message.reply_text(f"🔍 **Resultados para '{busqueda}':**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"))
+
+# --- SISTEMA DE FUSIÓN Y EDICIÓN DE CATEGORÍAS (ADMIN) ---
+async def iniciar_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("✏️ Renombrar/Fusionar Marca", callback_data="edit_tipo_marca")],
+        [InlineKeyboardButton("✏️ Renombrar Modelo", callback_data="edit_tipo_modelo")]
+    ]
+    await update.message.reply_text("⚙️ **Panel de Edición:** ¿Qué deseas corregir o fusionar?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def callback_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+
+    if data == "edit_tipo_marca":
+        cursor.execute("SELECT id, nombre FROM marcas ORDER BY nombre ASC")
+        marcas = cursor.fetchall()
+        conn.close()
+        keyboard = [[InlineKeyboardButton(f"📱 {m[1]}", callback_data=f"sel_mar_edit_{m[0]}")] for m in marcas]
+        await query.edit_message_text("Selecciona la MARCA que está mal escrita o deseas corregir/fusionar:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return EDIT_SELECCION
+
+    elif data == "edit_tipo_modelo":
+        cursor.execute("SELECT modelos.id, modelos.nombre, marcas.nombre FROM modelos JOIN marcas ON modelos.marca_id = marcas.id ORDER BY marcas.nombre ASC")
+        modelos = cursor.fetchall()
+        conn.close()
+        keyboard = [[InlineKeyboardButton(f"📲 {m[2]} - {m[1]}", callback_data=f"sel_mod_edit_{m[0]}")] for m in modelos]
+        await query.edit_message_text("Selecciona el MODELO que deseas cambiar de nombre:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return EDIT_SELECCION
+
+async def recibir_seleccion_edicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split("_")
+
+    tipo, item_id = data[2], data[3]
+    context.user_data['edit_tipo'] = tipo
+    context.user_data['edit_id'] = item_id
+
+    if tipo == "mar":
+        await query.edit_message_text("Escribe el **NUEVO NOMBRE** correcto para esta marca (si la marca correcta ya existe, los datos se fusionarán automáticamente):", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("Escribe el **NUEVO NOMBRE** correcto para este modelo:", parse_mode="Markdown")
+    return EDIT_NUEVO_NOMBRE
+
+async def procesar_nuevo_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nuevo_nombre = update.message.text.strip()
+    tipo = context.user_data['edit_tipo']
+    item_id = context.user_data['edit_id']
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+
+    if tipo == "mar":
+        nuevo_nombre = normalizar_marca(nuevo_nombre)
+        cursor.execute("SELECT id FROM marcas WHERE LOWER(nombre) = LOWER(?)", (nuevo_nombre,))
+        marca_existente = cursor.fetchone()
+
+        if marca_existente:
+            target_id = marca_existente[0]
+            if str(target_id) != str(item_id):
+                cursor.execute("UPDATE modelos SET marca_id = ? WHERE marca_id = ?", (target_id, item_id))
+                cursor.execute("DELETE FROM marcas WHERE id = ?", (item_id,))
+                conn.commit()
+                msg = f"🔄 **Fusión Exitosa:** Todos los modelos e información se trasladaron correctamente a **{nuevo_nombre}**."
+            else:
+                msg = "La marca ya tenía ese nombre exacto."
+        else:
+            cursor.execute("UPDATE marcas SET nombre = ? WHERE id = ?", (nuevo_nombre, item_id))
+            conn.commit()
+            msg = f"✅ Marca corregida exitosamente a: **{nuevo_nombre}**."
+
+    elif tipo == "mod":
+        cursor.execute("UPDATE modelos SET nombre = ? WHERE id = ?", (nuevo_nombre, item_id))
+        conn.commit()
+        msg = f"✅ Modelo renombrado a: **{nuevo_nombre}**."
+
+    conn.close()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return ConversationHandler.END
+
+# --- CARGA DE DATOS ---
+async def agregar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await enviar_auto_borrable(context, update.message.reply_text("⛔ No tienes permisos de administrador."))
+        return ConversationHandler.END
+
+    await enviar_auto_borrable(context, update.message.reply_text("➕ **Carga de Datos**\nEscribe el nombre de la **MARCA** (ej: Samsung, Xiaomi, Apple):"))
+    return MARCA
+
+async def recibir_marca(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    marca_raw = update.message.text.strip()
+    marca_corr = normalizar_marca(marca_raw)
+
+    context.user_data['marca'] = marca_corr
+
+    info_txt = f"💡 *Se corrigió automáticamente de '{marca_raw}' a '{marca_corr}'.*\n\n" if marca_raw.lower() != marca_corr.lower() else ""
+
+    await enviar_auto_borrable(context, update.message.reply_text(f"{info_txt}Marca guardada: **{marca_corr}**\n\nAhora escribe el **MODELO** (ej: Redmi Note 10, Galaxy A12):", parse_mode="Markdown"))
+    return MODELO
+
+async def recibir_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['modelo'] = update.message.text.strip()
+    await enviar_auto_borrable(context, update.message.reply_text(f"Modelo: **{context.user_data['modelo']}**\n\nEscribe la **FALLA / PROBLEMA**:", parse_mode="Markdown"))
+    return PROBLEMA
+
+async def recibir_problema(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['problema'] = update.message.text.strip()
+    await enviar_auto_borrable(context, update.message.reply_text("Escribe la **EXPLICACIÓN / SOLUCIÓN** en texto:", parse_mode="Markdown"))
+    return SOLUCION_TEXTO
+
+async def recibir_solucion_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['solucion_texto'] = update.message.text.strip()
+    await enviar_auto_borrable(context, update.message.reply_text("📷 Envía la **FOTO / ESQUEMÁTICO** (o escribe `omitir`):"))
+    return SOLUCION_FOTO
+
+async def recibir_solucion_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+
+    cursor.execute("INSERT OR IGNORE INTO marcas (nombre) VALUES (?)", (context.user_data['marca'],))
+    cursor.execute("SELECT id FROM marcas WHERE nombre = ?", (context.user_data['marca'],))
+    marca_id = cursor.fetchone()[0]
+
+    cursor.execute("SELECT id FROM modelos WHERE marca_id = ? AND LOWER(nombre) = LOWER(?)", (marca_id, context.user_data['modelo']))
+    res_mod = cursor.fetchone()
+    if res_mod:
+        modelo_id = res_mod[0]
+    else:
+        cursor.execute("INSERT INTO modelos (marca_id, nombre) VALUES (?, ?)", (marca_id, context.user_data['modelo']))
+        modelo_id = cursor.lastrowid
+
+    cursor.execute("INSERT INTO problemas (modelo_id, titulo) VALUES (?, ?)", (modelo_id, context.user_data['problema']))
+    problema_id = cursor.lastrowid
+
+    cursor.execute("INSERT INTO soluciones (problema_id, texto, photo_id) VALUES (?, ?, ?)", (problema_id, context.user_data['solucion_texto'], photo_id))
+
+    conn.commit()
+    conn.close()
+
+    await enviar_auto_borrable(context, update.message.reply_text("✅ **¡Solución guardada exitosamente!**"))
+    return ConversationHandler.END
+
+# --- SISTEMA DE GESTIÓN, EDICIÓN Y BORRADO DE SOLUCIONES (ADMIN) ---
+async def gestionar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await enviar_auto_borrable(context, update.message.reply_text("⛔ No tienes permisos de administrador."))
+        return ConversationHandler.END
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, nombre FROM marcas ORDER BY nombre ASC")
+    marcas = cursor.fetchall()
+    conn.close()
+
+    if not marcas:
+        await update.message.reply_text("⚠️ No hay soluciones cargadas aún.")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(f"📱 {m[1]}", callback_data=f"gestmar_{m[0]}")] for m in marcas]
+    await update.message.reply_text("🗑️ **Gestión de Soluciones:** Selecciona la MARCA:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return GEST_MODELO
+
+async def gest_recibir_marca(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    marca_id = query.data.split("_")[1]
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, nombre FROM modelos WHERE marca_id = ? ORDER BY nombre ASC", (marca_id,))
+    modelos = cursor.fetchall()
+    conn.close()
+
+    if not modelos:
+        await query.edit_message_text("⚠️ Esta marca no posee modelos registrados.")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(f"📲 {m[1]}", callback_data=f"gestmod_{m[0]}")] for m in modelos]
+    await query.edit_message_text("Selecciona el MODELO:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return GEST_PROB
+
+async def gest_recibir_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    modelo_id = query.data.split("_")[1]
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, titulo FROM problemas WHERE modelo_id = ?", (modelo_id,))
+    problemas = cursor.fetchall()
+    conn.close()
+
+    if not problemas:
+        await query.edit_message_text("⚠️ Este modelo no posee problemas registrados.")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(f"⚠️ {p[1]}", callback_data=f"gestprob_{p[0]}")] for p in problemas]
+    await query.edit_message_text("Selecciona la FALLA / PROBLEMA a gestionar:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return GEST_ACCION
+
+async def gest_recibir_problema(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prob_id = query.data.split("_")[1]
+    context.user_data['gest_prob_id'] = prob_id
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, texto, photo_id FROM soluciones WHERE problema_id = ?", (prob_id,))
+    solucion = cursor.fetchone()
+    conn.close()
+
+    if not solucion:
+        await query.edit_message_text("No existe solución vinculada.")
+        return ConversationHandler.END
+
+    context.user_data['gest_sol_id'] = solucion[0]
+
+    keyboard = [
+        [InlineKeyboardButton("❌ Eliminar Solución", callback_data="act_eliminar")],
+        [InlineKeyboardButton("✏️ Editar Texto", callback_data="act_edit_txt")],
+        [InlineKeyboardButton("🖼️ Cambiar Foto", callback_data="act_edit_img")]
+    ]
+    
+    txt_preview = solucion[1][:150] + "..." if len(solucion[1]) > 150 else solucion[1]
+    await query.edit_message_text(
+        f"⚙️ **Opciones de Gestión:**\n\n**Solución actual:** {txt_preview}\n\n¿Qué deseas hacer?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return GEST_ACCION
+
+async def gest_procesar_accion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    accion = query.data
+
+    sol_id = context.user_data['gest_sol_id']
+    prob_id = context.user_data['gest_prob_id']
+
+    if accion == "act_eliminar":
+        conn = sqlite3.connect('reparaciones.db')
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM valoraciones WHERE solucion_id = ?", (sol_id,))
+        cursor.execute("DELETE FROM soluciones WHERE id = ?", (sol_id,))
+        cursor.execute("DELETE FROM problemas WHERE id = ?", (prob_id,))
+        conn.commit()
+        conn.close()
+
+        await query.edit_message_text("🗑️ **Solución eliminada correctamente.**", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif accion == "act_edit_txt":
+        await query.edit_message_text("✍️ Escribe el **NUEVO TEXTO** de la solución:", parse_mode="Markdown")
+        return GEST_EDIT_TEXTO
+
+    elif accion == "act_edit_img":
+        await query.edit_message_text("📷 Envía la **NUEVA FOTO / ESQUEMÁTICO** (o escribe `omitir` para borrar la foto actual):", parse_mode="Markdown")
+        return GEST_EDIT_FOTO
+
+async def gest_guardar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nuevo_texto = update.message.text.strip()
+    sol_id = context.user_data['gest_sol_id']
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE soluciones SET texto = ? WHERE id = ?", (nuevo_texto, sol_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("✅ **Texto de la solución actualizado correctamente.**", parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def gest_guardar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sol_id = context.user_data['gest_sol_id']
+    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+
+    conn = sqlite3.connect('reparaciones.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE soluciones SET photo_id = ? WHERE id = ?", (photo_id, sol_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("✅ **Imagen de la solución actualizada correctamente.**", parse_mode="Markdown")
+    return ConversationHandler.END
+
+# --- LIMPIEZA DE CHAT Y BÚSQUEDAS ---
+async def limpiar_busquedas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    limpiados = sum(1 for u in context.application.user_data.values() if u.pop('esperando_busqueda', None))
+    chat_id = update.effective_chat.id
+    current_msg_id = update.message.message_id if update.message else 0
+
+    borrados = 0
+    for m_id in range(current_msg_id, max(1, current_msg_id - 100), -1):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
+            borrados += 1
+        except Exception:
+            pass
+
+    msg_conf = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🧹 **Chat limpiado.**\n• Estados restablecidos: `{limpiados}`\n• Mensajes borrados: `{borrados}`",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(update.effective_user.id)
+    )
+    context.job_queue.run_once(borrar_mensaje_job, when=10, data={"chat_id": chat_id, "message_id": msg_conf.message_id})
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await enviar_auto_borrable(context, update.message.reply_text("Proceso cancelado."))
+    return ConversationHandler.END
+
+# --- MAIN ---
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    admin_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler('agregar', agregar_start),
+            MessageHandler(filters.Regex('^➕ Agregar Solución$'), agregar_start)
+        ],
+        states={
+            MARCA: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_marca)],
+            MODELO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_modelo)],
+            PROBLEMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_problema)],
+            SOLUCION_TEXTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_solucion_texto)],
+            SOLUCION_FOTO: [MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), recibir_solucion_foto)],
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar)]
+    )
+
+    edit_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex('^✏️ Editar Categoría$'), iniciar_edicion),
+            CallbackQueryHandler(callback_edicion, pattern="^edit_tipo_")
+        ],
+        states={
+            EDIT_SELECCION: [CallbackQueryHandler(recibir_seleccion_edicion, pattern="^sel_")],
+            EDIT_NUEVO_NOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_nuevo_nombre)],
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar)]
+    )
+
+    gest_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex('^🗑️ Gestionar / Borrar$'), gestionar_start)
+        ],
+        states={
+            GEST_MODELO: [CallbackQueryHandler(gest_recibir_marca, pattern="^gestmar_")],
+            GEST_PROB: [CallbackQueryHandler(gest_recibir_modelo, pattern="^gestmod_")],
+            GEST_ACCION: [
+                CallbackQueryHandler(gest_recibir_problema, pattern="^gestprob_"),
+                CallbackQueryHandler(gest_procesar_accion, pattern="^act_")
+            ],
+            GEST_EDIT_TEXTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, gest_guardar_texto)],
+            GEST_EDIT_FOTO: [MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), gest_guardar_foto)]
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar)]
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("limpiar_busquedas", limpiar_busquedas))
+    app.add_handler(admin_conv)
+    app.add_handler(edit_conv)
+    app.add_handler(gest_conv)
+    app.add_handler(CallbackQueryHandler(user_navigation))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+
+    print("Bot activo...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    keep_alive()  # Servidor web en segundo plano para Render
+    main()
